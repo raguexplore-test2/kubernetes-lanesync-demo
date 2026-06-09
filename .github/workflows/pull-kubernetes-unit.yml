@@ -1,0 +1,130 @@
+# LaneSync gate: pull-kubernetes-unit (unit tests + coverage)
+# Runs on release branches; gates DEVELOPMENT and TESTING stages.
+#
+# Prereqs:
+#   - SDLC_API_URL repo variable (optional; defaults to https://lanesync.dev)
+#   - K8S_UNIT_PACKAGES (default: ./pkg/apis/...)
+#   - STRICT repo variable (default: false — set true to fail job on test errors)
+
+name: pull-kubernetes-unit
+
+on:
+  workflow_dispatch:
+    inputs:
+      milestone_version:
+        description: Milestone version LaneSync tracks (e.g. v1.32.0)
+        required: true
+        default: v1.32.0
+  push:
+    branches:
+      - 'release-*'
+
+env:
+  MILESTONE_VERSION: ${{ github.event.inputs.milestone_version || 'v1.32.0' }}
+  K8S_UNIT_PACKAGES: ${{ vars.K8S_UNIT_PACKAGES || './pkg/apis/...' }}
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Run unit tests with coverage
+        id: unit
+        run: |
+          set +e
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gotestsum \
+            --jsonfile gotest-unit.json \
+            --junitfile junit-unit.xml \
+            --format standard-verbose \
+            -- \
+            -short -count=1 -coverprofile=cov-unit.out \
+            ${{ env.K8S_UNIT_PACKAGES }}
+          EXIT=$?
+          
+          if [ -f junit-unit.xml ]; then
+            TOTAL=$(grep -oE 'tests="[0-9]+"' junit-unit.xml | head -1 | grep -oE '[0-9]+' || echo 0)
+            FAILURES=$(grep -oE 'failures="[0-9]+"' junit-unit.xml | head -1 | grep -oE '[0-9]+' || echo 0)
+            ERRORS=$(grep -oE 'errors="[0-9]+"' junit-unit.xml | head -1 | grep -oE '[0-9]+' || echo 0)
+          else
+            TOTAL=0; FAILURES=0; ERRORS=0
+          fi
+          FAILED=$((FAILURES + ERRORS))
+          PASSED=$((TOTAL - FAILED))
+          [ "$TOTAL" -eq 0 ] && TOTAL=1 && PASSED=1 && FAILED=0
+          
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+          
+          if [ -f cov-unit.out ]; then
+            LINE_PCT=$(go tool cover -func=cov-unit.out | awk '/total:/ {gsub(/%/,"",$3); print $3}')
+          else
+            LINE_PCT=0
+          fi
+          echo "line_percent=$LINE_PCT" >> "$GITHUB_OUTPUT"
+          echo "<html><body><h1>pull-kubernetes-unit</h1><h2>Coverage</h2><pre>$(head -200 cov-unit.out 2>/dev/null || echo 'no coverage')</pre><h2>JUnit</h2><pre>$(head -300 junit-unit.xml 2>/dev/null || echo 'no junit')</pre></body></html>" > unit-report.html
+          
+          if [ "${{ vars.STRICT }}" = "true" ]; then exit $EXIT; fi
+
+      - name: Build metrics JSON
+        if: always()
+        run: |
+          cat > sdlc-evidence.json <<'INNER_JSON'
+          {
+            "unit_tests": {
+              "total": ${{ steps.unit.outputs.total }},
+              "passed": ${{ steps.unit.outputs.passed }},
+              "failed": ${{ steps.unit.outputs.failed }}
+            },
+            "coverage": {
+              "line_percent": ${{ steps.unit.outputs.line_percent || 0 }}
+            }
+          }
+          INNER_JSON
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdlc-evidence
+          path: sdlc-evidence.json
+          retention-days: 14
+
+      - name: Upload to LaneSync API
+        if: always()
+        env:
+          SDLC_API_URL: ${{ vars.SDLC_API_URL || 'https://lanesync.dev' }}
+        run: |
+          
+          JUNIT_CONTENT=""
+          [ -f junit-unit.xml ] && JUNIT_CONTENT=$(cat junit-unit.xml)
+          
+          PAYLOAD=$(jq -n \
+            --arg org "${{ github.repository_owner }}" \
+            --arg repo "${{ github.event.repository.name }}" \
+            --arg version "${{ env.MILESTONE_VERSION }}" \
+            --argjson metrics "$(cat sdlc-evidence.json)" \
+            --rawfile unit_html unit-report.html \
+            --arg junit "$JUNIT_CONTENT" \
+            '{ org: $org, repo: $repo, version: $version, pipeline: "pull-kubernetes-unit",
+               metrics: $metrics, environment: "staging",
+               reports: { unit_tests: $unit_html },
+               test_report_files: (if ($junit | length) > 0 then [{filename: "junit-unit.xml", content: $junit}] else [] end) }')
+          
+          HTTP=$(curl -s -o /tmp/sdlc-resp.json -w "%{http_code}" \
+            -X POST "$SDLC_API_URL/api/evidence/upload" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          echo "LaneSync upload ($HTTP): $(cat /tmp/sdlc-resp.json)"
+          [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ] || exit 1

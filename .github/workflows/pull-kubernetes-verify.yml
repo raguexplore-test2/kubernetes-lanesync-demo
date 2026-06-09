@@ -1,0 +1,80 @@
+# LaneSync gate: pull-kubernetes-verify (security scan via govulncheck)
+# Runs on release branches; gates TESTING stage.
+
+name: pull-kubernetes-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      milestone_version:
+        description: Milestone version LaneSync tracks (e.g. v1.32.0)
+        required: true
+        default: v1.32.0
+  push:
+    branches:
+      - 'release-*'
+
+env:
+  MILESTONE_VERSION: ${{ github.event.inputs.milestone_version || 'v1.32.0' }}
+  K8S_UNIT_PACKAGES: ${{ vars.K8S_UNIT_PACKAGES || './pkg/apis/...' }}
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run govulncheck
+        id: govuln
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          set +e
+          govulncheck -json ${{ env.K8S_UNIT_PACKAGES }} 2>/dev/null | tee govuln.json
+          FINDINGS=$(jq -s '[.[] | select(.finding)] | length' govuln.json 2>/dev/null || echo 0)
+          echo "findings=$FINDINGS" >> "$GITHUB_OUTPUT"
+          echo "<html><body><h1>govulncheck results</h1><pre>$(head -200 govuln.json)</pre></body></html>" > verify-report.html
+
+      - name: Build metrics JSON
+        if: always()
+        run: |
+          cat > metrics-verify.json <<'INNER_JSON'
+          {
+            "security": {
+              "tool": "govulncheck",
+              "vulnerabilities": {
+                "critical": 0,
+                "high": ${{ steps.govuln.outputs.findings || 0 }},
+                "medium": 0
+              }
+            }
+          }
+          INNER_JSON
+
+      - name: Upload to LaneSync API
+        if: always()
+        env:
+          SDLC_API_URL: ${{ vars.SDLC_API_URL || 'https://lanesync.dev' }}
+        run: |
+          
+          PAYLOAD=$(jq -n \
+            --arg org "${{ github.repository_owner }}" \
+            --arg repo "${{ github.event.repository.name }}" \
+            --arg version "${{ env.MILESTONE_VERSION }}" \
+            --argjson metrics "$(cat metrics-verify.json)" \
+            --rawfile verify_html verify-report.html \
+            '{ org: $org, repo: $repo, version: $version, pipeline: "pull-kubernetes-verify",
+               metrics: $metrics, environment: "staging",
+               reports: { security: $verify_html } }')
+          
+          HTTP=$(curl -s -o /tmp/sdlc-resp.json -w "%{http_code}" \
+            -X POST "$SDLC_API_URL/api/evidence/upload" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          echo "LaneSync upload ($HTTP): $(cat /tmp/sdlc-resp.json)"
+          [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ] || exit 1

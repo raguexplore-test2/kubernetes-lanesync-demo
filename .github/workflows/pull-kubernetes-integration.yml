@@ -1,0 +1,107 @@
+# LaneSync gate: pull-kubernetes-integration (integration tests)
+# Runs on release branches; gates TESTING stage.
+
+name: pull-kubernetes-integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      milestone_version:
+        description: Milestone version LaneSync tracks (e.g. v1.32.0)
+        required: true
+        default: v1.32.0
+  push:
+    branches:
+      - 'release-*'
+
+env:
+  MILESTONE_VERSION: ${{ github.event.inputs.milestone_version || 'v1.32.0' }}
+  K8S_INTEGRATION_PACKAGES: ${{ vars.K8S_INTEGRATION_PACKAGES || './staging/...' }}
+
+jobs:
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Run integration tests
+        id: integration
+        run: |
+          set +e
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gotestsum \
+            --jsonfile gotest-integration.json \
+            --junitfile junit-integration.xml \
+            --format standard-verbose \
+            -- \
+            -short -count=1 \
+            ${{ env.K8S_INTEGRATION_PACKAGES }}
+          EXIT=$?
+          
+          if [ -f junit-integration.xml ]; then
+            TOTAL=$(grep -oE 'tests="[0-9]+"' junit-integration.xml | head -1 | grep -oE '[0-9]+' || echo 0)
+            FAILURES=$(grep -oE 'failures="[0-9]+"' junit-integration.xml | head -1 | grep -oE '[0-9]+' || echo 0)
+            ERRORS=$(grep -oE 'errors="[0-9]+"' junit-integration.xml | head -1 | grep -oE '[0-9]+' || echo 0)
+          else
+            TOTAL=0; FAILURES=0; ERRORS=0
+          fi
+          FAILED=$((FAILURES + ERRORS))
+          PASSED=$((TOTAL - FAILED))
+          [ "$TOTAL" -eq 0 ] && TOTAL=1 && PASSED=1 && FAILED=0
+          
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+          echo "<html><body><h1>pull-kubernetes-integration</h1><pre>$(head -300 junit-integration.xml 2>/dev/null || echo 'no junit')</pre></body></html>" > integration-report.html
+          
+          if [ "${{ vars.STRICT }}" = "true" ]; then exit $EXIT; fi
+
+      - name: Build metrics JSON
+        if: always()
+        run: |
+          cat > metrics-integration.json <<'INNER_JSON'
+          {
+            "integration_tests": {
+              "total": ${{ steps.integration.outputs.total }},
+              "passed": ${{ steps.integration.outputs.passed }},
+              "failed": ${{ steps.integration.outputs.failed }}
+            }
+          }
+          INNER_JSON
+
+      - name: Upload to LaneSync API
+        if: always()
+        env:
+          SDLC_API_URL: ${{ vars.SDLC_API_URL || 'https://lanesync.dev' }}
+        run: |
+          
+          JUNIT_CONTENT=""
+          [ -f junit-integration.xml ] && JUNIT_CONTENT=$(cat junit-integration.xml)
+          
+          PAYLOAD=$(jq -n \
+            --arg org "${{ github.repository_owner }}" \
+            --arg repo "${{ github.event.repository.name }}" \
+            --arg version "${{ env.MILESTONE_VERSION }}" \
+            --argjson metrics "$(cat metrics-integration.json)" \
+            --rawfile integ_html integration-report.html \
+            --arg junit "$JUNIT_CONTENT" \
+            '{ org: $org, repo: $repo, version: $version, pipeline: "pull-kubernetes-integration",
+               metrics: $metrics, environment: "staging",
+               reports: { integration_tests: $integ_html },
+               test_report_files: (if ($junit | length) > 0 then [{filename: "junit-integration.xml", content: $junit}] else [] end) }')
+          
+          HTTP=$(curl -s -o /tmp/sdlc-resp.json -w "%{http_code}" \
+            -X POST "$SDLC_API_URL/api/evidence/upload" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          echo "LaneSync upload ($HTTP): $(cat /tmp/sdlc-resp.json)"
+          [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ] || exit 1

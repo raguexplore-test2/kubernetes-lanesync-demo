@@ -1,0 +1,78 @@
+# LaneSync informational (non-blocking): SAST Scan
+# Runs on release branches; does NOT gate stages (skips gracefully if disabled).
+# Pulls static-analysis findings from GitHub code scanning (CodeQL or any SARIF tool).
+#
+# Prereqs:
+#   - SDLC_API_URL repo variable (optional; defaults to https://lanesync.dev)
+#   - GitHub code scanning enabled (optional — job skips if not available)
+
+name: SAST Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      milestone_version:
+        description: Milestone version LaneSync tracks (e.g. v1.32.0)
+        required: true
+        default: v1.32.0
+  push:
+    branches:
+      - 'release-*'
+
+env:
+  MILESTONE_VERSION: ${{ github.event.inputs.milestone_version || 'v1.32.0' }}
+
+jobs:
+  code-scanning:
+    name: Code Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+    steps:
+      - name: Fetch code scanning alerts
+        id: sast
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          ALERTS=$(gh api "repos/${{ github.repository }}/code-scanning/alerts" --paginate 2>/dev/null)
+          if [ $? -ne 0 ] || [ -z "$ALERTS" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Code scanning not enabled or no access — skipping SAST card."
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "$ALERTS" | jq '[.[] | select(.state == "open")] | {
+            critical: ([.[] | select(.rule.security_severity_level == "critical")] | length),
+            high: ([.[] | select(.rule.security_severity_level == "high")] | length),
+            medium: ([.[] | select(.rule.security_severity_level == "medium" or .rule.security_severity_level == "moderate")] | length),
+            scanned_files: ([.[].most_recent_instance.location.path] | unique | length)
+          }' > sast-summary.json
+          echo "<html><body><h1>SAST Scan alerts</h1><pre>$(cat sast-summary.json)</pre></body></html>" > sast-report.html
+
+      - name: Upload to LaneSync API
+        if: always() && steps.sast.outputs.enabled == 'true'
+        env:
+          SDLC_API_URL: ${{ vars.SDLC_API_URL || 'https://lanesync.dev' }}
+        run: |
+          
+          SUMMARY=$(cat sast-summary.json)
+          PAYLOAD=$(jq -n \
+            --arg org "${{ github.repository_owner }}" \
+            --arg repo "${{ github.event.repository.name }}" \
+            --arg version "${{ env.MILESTONE_VERSION }}" \
+            --argjson critical "$(echo "$SUMMARY" | jq '.critical')" \
+            --argjson high "$(echo "$SUMMARY" | jq '.high')" \
+            --argjson medium "$(echo "$SUMMARY" | jq '.medium')" \
+            --argjson scanned "$(echo "$SUMMARY" | jq '.scanned_files')" \
+            --rawfile sast_html sast-report.html \
+            '{ org: $org, repo: $repo, version: $version, pipeline: "SAST Scan",
+               metrics: { sast_scan: { vulnerabilities: { critical: $critical, high: $high, medium: $medium }, scanned_files: $scanned } },
+               environment: "staging", reports: { sast_scan: $sast_html } }')
+          
+          HTTP=$(curl -s -o /tmp/sdlc-resp.json -w "%{http_code}" \
+            -X POST "$SDLC_API_URL/api/evidence/upload" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          echo "LaneSync SAST Scan ($HTTP): $(cat /tmp/sdlc-resp.json)"
+          [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ] || exit 1

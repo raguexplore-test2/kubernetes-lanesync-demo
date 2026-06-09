@@ -1,0 +1,38 @@
+# LaneSync config for kubernetes fork (release-branch demo)
+# Copy to repo root as sdlc.yaml after wizard bootstrap.
+#
+# Gates: workflow names must match these check names.
+# Evidence pipelines (Quality dashboard cards) inherit the same names.
+
+version: v1
+name: kubernetes-lanesync-demo
+
+stages:
+  planning:
+    require_milestone: true
+    require_issues_assigned: true
+
+  development:
+    branch: master
+    deploy_target: dev
+    required_checks:
+      - "pull-kubernetes-unit"
+
+  testing:
+    branch_pattern: "release-**"
+    deploy_target: staging
+    required_checks:
+      - "pull-kubernetes-unit"
+      - "pull-kubernetes-integration"
+      - "pull-kubernetes-verify"
+
+  evidencing:
+    required_artifacts:
+      - sdlc-evidence
+    required_reviewers:
+      min_approvals: 1
+
+  deployment:
+    target: production
+    promotion: manual
+    requires_evidence_approval: true
